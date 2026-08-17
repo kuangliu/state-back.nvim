@@ -21,7 +21,7 @@ With [lazy.nvim](https://github.com/folke/lazy.nvim):
 
 ```lua
 {
-  dir = vim.fn.stdpath('config') .. '/state-back.nvim',
+  'kuangliu/state-back.nvim',
   event = 'UIEnter',
   config = function()
     require('state-back').setup()
