@@ -5,8 +5,20 @@ local M = {}
 -- Directory holding one JSON state file per working directory.
 M.dir = vim.fn.stdpath('state') .. '/state-back'
 
+-- Pure-Lua directory hash. vim.fn.sha256 costs ~3 ms on its first call in a
+-- process (JIT/allocator warmup), and this runs inside the plugin's load span,
+-- so keep state file naming cheap and deterministic instead. Same 16-hex shape
+-- as the sha256 prefix it replaces.
+local function hash_dir(cwd)
+  local h = 5381
+  for i = 1, #cwd do
+    h = (h * 33) % 4294967295 + cwd:byte(i)
+  end
+  return string.format('%016x', h % 4294967296)
+end
+
 local function file_for(cwd)
-  return M.dir .. '/' .. vim.fn.sha256(cwd):sub(1, 16) .. '.json'
+  return M.dir .. '/' .. hash_dir(cwd) .. '.json'
 end
 
 --- Read the saved state for {cwd}; nil when missing or corrupt.

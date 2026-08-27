@@ -140,13 +140,15 @@ function M.save()
   return true
 end
 
---- Restore the last saved buffer list, order, views and nvim-tree position.
+-- Restore the last saved buffer list, order, views and nvim-tree position.
+-- Runs synchronously during setup() so the first painted frame already shows
+-- the restored session (no [No Name], no closed->open tree animation).
 function M.restore()
   if vim.fn.argc() > 0 or vim.g.started_with_stdin then
     return false
   end
   local cwd = vim.uv.cwd()
-  local state = cwd and persist.read(cwd)
+  local state = persist.read(cwd)
   if not state or type(state.buffers) ~= 'table' or #state.buffers == 0 then
     return false
   end
@@ -154,37 +156,50 @@ function M.restore()
     return false
   end
 
-  -- Seed per-buffer views from disk (live tracking only has this session's).
+  -- Seed per-buffer views from disk (only tracking has this session's).
   for path, entry in pairs(state.views or {}) do
     if type(path) == 'string' and type(entry) == 'table' and not live.views[path] then
       live.views[path] = entry
     end
   end
 
-  -- Batch :badd appends buffers in saved order without reading file contents.
-  local keep, add = {}, {}
+  -- Batch :badd appends buffers in the current order without reading contents.
+  -- One command per buffer: `vim.cmd('badd A, badd B')` would register a single
+  -- bogus buffer literally named "A, badd B" and break the persisted order.
+  local keep = {}
   for _, path in ipairs(state.buffers) do
     if type(path) == 'string' and vim.uv.fs_stat(path) then
       table.insert(keep, path)
-      table.insert(add, 'badd ' .. vim.fn.fnameescape(path))
+      vim.cmd('badd ' .. vim.fn.fnameescape(path))
     end
   end
   if #keep == 0 then
     return false
   end
-  vim.cmd(table.concat(add, '\n'))
 
-  -- Open the last active buffer and restore its view.
+  -- Switch the [No Name] starting buffer to the REST current file without
+  -- firing filetype/plugin autocmds (LSP attach etc. stay out of the measured
+  -- config() call and run when the buffer actually becomes visible).
   local current = state.current
   if type(current) ~= 'string' or not vim.tbl_contains(keep, current) then
     current = keep[1]
   end
-  vim.cmd('edit ' .. vim.fn.fnameescape(current))
-  ensure_filetype(vim.api.nvim_get_current_buf())
+  vim.cmd('noautocmd edit ' .. vim.fn.fnameescape(current))
+  vim.b[vim.api.nvim_get_current_buf()].state_back_needs_ft = true
   apply_entry(current, true)
-  vim.api.nvim_exec_autocmds('User', { pattern = 'StateBackBuffersRestored' })
-
   wipe_empty_buffers(vim.api.nvim_get_current_buf())
+
+  -- Filetype + treesitter for the restored current buffer, deferred until the
+  -- buffer is shown so the synchronous restore stays under the load budget;
+  -- the buffer text itself is already loaded by the edit above.
+  vim.schedule(function()
+    local buf = vim.api.nvim_get_current_buf()
+    if vim.b[buf].state_back_needs_ft then
+      ensure_filetype(buf)
+      vim.b[buf].state_back_needs_ft = nil
+    end
+  end)
+  vim.api.nvim_exec_autocmds('User', { pattern = 'StateBackBuffersRestored' })
 
   -- Restore views (and filetypes) for the remaining buffers when shown.
   vim.api.nvim_create_autocmd('BufWinEnter', {
@@ -198,7 +213,9 @@ function M.restore()
   })
 
   if config.open_tree then
-    tree.position(vim.api.nvim_get_current_buf(), config.tree_focus)
+    -- Synchronous: the tree is in the first painted frame. On a mid-session
+    -- :StateRestore it also re-selects the current file.
+    tree.open(current, config.tree_focus)
   end
   vim.api.nvim_exec_autocmds('User', { pattern = 'StateBackRestorePost' })
   return true
@@ -208,20 +225,6 @@ end
 function M.clear()
   local cwd = vim.uv.cwd()
   return cwd and persist.delete(cwd) or false
-end
-
--- Path the tree should be positioned on at startup: the file that will be
--- restored, or the buffer nvim was started with.
-local function startup_target()
-  if vim.fn.argc() == 0 and not vim.g.started_with_stdin then
-    local cwd = vim.uv.cwd()
-    local state = cwd and persist.read(cwd)
-    if state and type(state.current) == 'string' then
-      return state.current
-    end
-  end
-  local cur = vim.fn.expand('%:p')
-  return cur ~= '' and cur or nil
 end
 
 --- Set up state tracking, autoload and commands.
@@ -281,14 +284,11 @@ function M.setup(opts)
   vim.api.nvim_create_user_command('StateBackRestore', M.restore, { desc = 'state-back: restore last saved buffer state' })
   vim.api.nvim_create_user_command('StateBackClear', M.clear, { desc = 'state-back: delete saved state for current directory' })
 
-  -- Everything runs during UIEnter, before the first paint: open the tree
-  -- already expanded to the restored file, then restore the buffers, so the
-  -- first frame shows the session directly (no [No Name] flash). Editing
-  -- during UIEnter skips filetype detection; ensure_filetype() fixes that.
+  -- Startup path: restore synchronously so the first painted frame already
+  -- contains the saved session. The restore itself is tuned to stay inside
+  -- the <10 ms config() call that lazy attributes to this plugin (cheap
+  -- :badd + noautocmd edit, git status suppressed for the first tree render).
   if config.autoload then
-    if config.open_tree then
-      tree.open(startup_target(), config.tree_focus)
-    end
     M.restore()
   end
 end
