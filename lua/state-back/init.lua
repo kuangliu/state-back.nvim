@@ -23,6 +23,12 @@ local config = {
   open_tree = true,
   -- Keep the nvim-tree window focused (default: editor keeps focus).
   tree_focus = false,
+  -- Sync (non-deferred) restore of the current buffer's filetype + treesitter,
+  -- so the FIRST painted frame shows syntax highlighting instead of a flash of
+  -- uncolored (default fg) text. Costs a few ms inside the restore span.
+  sync_filetype = true,
+  -- Print a startup timing table from setup() to help tune the load budget.
+  log_stats = false,
 }
 
 local augroup = vim.api.nvim_create_augroup('state_back', { clear = true })
@@ -189,16 +195,24 @@ function M.restore()
   apply_entry(current, true)
   wipe_empty_buffers(vim.api.nvim_get_current_buf())
 
-  -- Filetype + treesitter for the restored current buffer, deferred until the
-  -- buffer is shown so the synchronous restore stays under the load budget;
-  -- the buffer text itself is already loaded by the edit above.
-  vim.schedule(function()
-    local buf = vim.api.nvim_get_current_buf()
-    if vim.b[buf].state_back_needs_ft then
-      ensure_filetype(buf)
-      vim.b[buf].state_back_needs_ft = nil
-    end
-  end)
+  -- Filetype + treesitter for the restored current buffer. Default is
+  -- synchronous so the FIRST painted frame already has highlight groups
+  -- (otherwise the buffer shows uncolored/default-fg text for a frame until
+  -- the deferred callback attaches). Set sync_filetype=false to go back to
+  -- deferring, if your measured span needs the extra ms.
+  local cur = vim.api.nvim_get_current_buf()
+  if config.sync_filetype and vim.b[cur].state_back_needs_ft then
+    ensure_filetype(cur)
+    vim.b[cur].state_back_needs_ft = nil
+  else
+    vim.schedule(function()
+      local buf = vim.api.nvim_get_current_buf()
+      if vim.b[buf].state_back_needs_ft then
+        ensure_filetype(buf)
+        vim.b[buf].state_back_needs_ft = nil
+      end
+    end)
+  end
   vim.api.nvim_exec_autocmds('User', { pattern = 'StateBackBuffersRestored' })
 
   -- Restore views (and filetypes) for the remaining buffers when shown.
@@ -289,7 +303,15 @@ function M.setup(opts)
   -- the <10 ms config() call that lazy attributes to this plugin (cheap
   -- :badd + noautocmd edit, git status suppressed for the first tree render).
   if config.autoload then
-    M.restore()
+    local t0 = vim.loop.hrtime()
+    local restored = M.restore()
+    if config.log_stats and restored then
+      local nbufs = #vim.fn.getbufinfo({ buflisted = 1 })
+      local ft = vim.bo[vim.api.nvim_get_current_buf()].filetype
+      vim.notify(
+        string.format('state-back: restore %.1f ms (%d buffers, ft=%s)', (vim.loop.hrtime() - t0) / 1e6, nbufs, ft)
+      )
+    end
   end
 end
 
