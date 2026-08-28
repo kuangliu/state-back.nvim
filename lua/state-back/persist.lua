@@ -47,9 +47,9 @@ function M.write(cwd, data)
   if not ok then
     return false, err
   end
-  local renamed = pcall(vim.rename, tmp, file)
-  if not renamed then
-    pcall(vim.fn.rename, tmp, file)
+  if not pcall(vim.uv.fs_rename, tmp, file) then
+    pcall(vim.fn.delete, tmp)
+    return false, ('rename failed for ' .. file)
   end
   return true
 end

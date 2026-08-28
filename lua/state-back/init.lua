@@ -5,31 +5,31 @@
 -- tiny JSON file per working directory, so save (VimLeavePre) and restore
 -- (UIEnter) are much cheaper than :mksession-based plugins.
 
-local M = {}
-
 local persist = require('state-back.persist')
 local tree = require('state-back.tree')
 
 local config = {
   -- Directory holding one JSON state file per working directory.
   dir = persist.dir,
-  -- Save state on exit (VimLeavePre).
+  -- Save state on exit (VimLeavePre). :StateBackSave always works.
   autosave = true,
-  -- Restore state on startup (UIEnter).
+  -- Restore state on startup (UIEnter). Never runs when nvim was started
+  -- with file arguments or piped stdin.
   autoload = true,
-  -- Only auto-restore when nvim was started without file arguments.
-  restore_only_without_args = true,
   -- Open nvim-tree at startup and point it at the current file.
   open_tree = true,
   -- Keep the nvim-tree window focused (default: editor keeps focus).
   tree_focus = false,
-  -- Sync (non-deferred) restore of the current buffer's filetype + treesitter,
-  -- so the FIRST painted frame shows syntax highlighting instead of a flash of
-  -- uncolored (default fg) text. Costs a few ms inside the restore span.
-  sync_filetype = true,
-  -- Print a startup timing table from setup() to help tune the load budget.
+  -- Restore filetype + treesitter synchronously so the FIRST painted frame
+  -- shows syntax highlighting instead of a flash of uncolored text. Costs
+  -- ~7ms (vim.filetype.match + vim.treesitter.start + FileType hooks such as
+  -- LSP attach), which pushes the default config over the <5ms load goal.
+  sync_filetype = false,
+  -- Notify the restore timing from setup() to help tune the load budget.
   log_stats = false,
 }
+
+local M = {}
 
 local augroup = vim.api.nvim_create_augroup('state_back', { clear = true })
 
@@ -52,12 +52,6 @@ local function record_view(path)
   live.views[path] = { cursor = { view.lnum, view.col }, view = view }
 end
 
-local function record_cursor(path)
-  local entry = live.views[path] or {}
-  entry.cursor = vim.api.nvim_win_get_cursor(0)
-  live.views[path] = entry
-end
-
 -- :badd + :edit (and nvim-tree opening during UIEnter) can skip filetype
 -- detection, which would leave buffers without treesitter highlighting.
 -- Match and set it explicitly; setting 'filetype' fires FileType.
@@ -77,10 +71,10 @@ local function apply_entry(path, force)
     return
   end
   live.applied[path] = true
-  local view = entry.view
-  if view and view.lnum then
-    pcall(vim.fn.winrestview, view)
+  if entry.view and entry.view.lnum then
+    pcall(vim.fn.winrestview, entry.view)
   elseif entry.cursor then
+    -- Legacy state files store a bare cursor for some buffers.
     local last = math.max(vim.fn.line('$'), 1)
     local row = math.min(entry.cursor[1] or 1, last)
     pcall(vim.api.nvim_win_set_cursor, 0, { row, entry.cursor[2] or 0 })
@@ -103,31 +97,31 @@ end
 
 --- Save the current buffer list, order and views to disk.
 function M.save()
-  if not config.autosave then
-    return false
-  end
   local cwd = vim.uv.cwd()
   if not cwd then
     return false
   end
 
-  -- Capture the final view of the buffer about to be left behind.
-  local current_buf = vim.api.nvim_get_current_buf()
-  if is_restorable(current_buf) then
-    record_view(vim.api.nvim_buf_get_name(current_buf))
+  -- Capture the final view of the buffer being left behind.
+  local cur = vim.api.nvim_get_current_buf()
+  if is_restorable(cur) then
+    record_view(vim.api.nvim_buf_get_name(cur))
   end
 
   -- nvim_list_bufs() is ordered exactly like the buffer list (:ls).
   local buffers = {}
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
     if is_restorable(bufnr) then
-      table.insert(buffers, vim.api.nvim_buf_get_name(bufnr))
+      buffers[#buffers + 1] = vim.api.nvim_buf_get_name(bufnr)
     end
   end
 
-  local current = live.current
-  if not vim.tbl_contains(buffers, current) then
-    current = vim.api.nvim_buf_get_name(current_buf)
+  -- Prefer the buffer actually current at save time (covers mid-session
+  -- :StateBackSave); fall back to the last tracked file buffer, which is
+  -- what a tree/terminal window shows at VimLeavePre.
+  local current = vim.api.nvim_buf_get_name(cur)
+  if not is_restorable(cur) then
+    current = live.current
   end
   if not vim.tbl_contains(buffers, current) then
     current = buffers[1]
@@ -135,7 +129,7 @@ function M.save()
 
   local ok, err = persist.write(cwd, {
     cwd = cwd,
-    current = current or '',
+    current = current,
     buffers = buffers,
     views = live.views,
   })
@@ -150,15 +144,18 @@ end
 -- Runs synchronously during setup() so the first painted frame already shows
 -- the restored session (no [No Name], no closed->open tree animation).
 function M.restore()
-  if vim.fn.argc() > 0 or vim.g.started_with_stdin then
+  -- Never restore over file arguments or piped stdin. StdinReadPre (registered
+  -- in setup) covers eager loads; the modified [No Name] check covers lazy
+  -- UIEnter loads, where that event fired before we could listen for it.
+  if vim.fn.argc() > 0 or vim.g.started_with_stdin or vim.bo[0].modified then
     return false
   end
   local cwd = vim.uv.cwd()
-  local state = persist.read(cwd)
-  if not state or type(state.buffers) ~= 'table' or #state.buffers == 0 then
+  if not cwd then
     return false
   end
-  if state.cwd ~= cwd then
+  local state = persist.read(cwd)
+  if not state or state.cwd ~= cwd or type(state.buffers) ~= 'table' then
     return false
   end
 
@@ -175,7 +172,7 @@ function M.restore()
   local keep = {}
   for _, path in ipairs(state.buffers) do
     if type(path) == 'string' and vim.uv.fs_stat(path) then
-      table.insert(keep, path)
+      keep[#keep + 1] = path
       vim.cmd('badd ' .. vim.fn.fnameescape(path))
     end
   end
@@ -183,34 +180,26 @@ function M.restore()
     return false
   end
 
-  -- Switch the [No Name] starting buffer to the REST current file without
+  -- Switch the [No Name] starting buffer to the saved current file without
   -- firing filetype/plugin autocmds (LSP attach etc. stay out of the measured
-  -- config() call and run when the buffer actually becomes visible).
+  -- setup() span and run when the buffer becomes visible).
   local current = state.current
   if type(current) ~= 'string' or not vim.tbl_contains(keep, current) then
     current = keep[1]
   end
   vim.cmd('noautocmd edit ' .. vim.fn.fnameescape(current))
-  vim.b[vim.api.nvim_get_current_buf()].state_back_needs_ft = true
   apply_entry(current, true)
   wipe_empty_buffers(vim.api.nvim_get_current_buf())
 
-  -- Filetype + treesitter for the restored current buffer. Default is
-  -- synchronous so the FIRST painted frame already has highlight groups
-  -- (otherwise the buffer shows uncolored/default-fg text for a frame until
-  -- the deferred callback attaches). Set sync_filetype=false to go back to
-  -- deferring, if your measured span needs the extra ms.
-  local cur = vim.api.nvim_get_current_buf()
-  if config.sync_filetype and vim.b[cur].state_back_needs_ft then
-    ensure_filetype(cur)
-    vim.b[cur].state_back_needs_ft = nil
+  -- Filetype + treesitter for the restored current buffer: synchronously with
+  -- sync_filetype so the first painted frame has highlighting, else one tick
+  -- later to keep FileType hooks (LSP attach, treesitter) out of the measured
+  -- setup() span.
+  if config.sync_filetype then
+    ensure_filetype(vim.api.nvim_get_current_buf())
   else
     vim.schedule(function()
-      local buf = vim.api.nvim_get_current_buf()
-      if vim.b[buf].state_back_needs_ft then
-        ensure_filetype(buf)
-        vim.b[buf].state_back_needs_ft = nil
-      end
+      ensure_filetype(vim.api.nvim_get_current_buf())
     end)
   end
   vim.api.nvim_exec_autocmds('User', { pattern = 'StateBackBuffersRestored' })
@@ -228,7 +217,8 @@ function M.restore()
 
   if config.open_tree then
     -- Synchronous: the tree is in the first painted frame. On a mid-session
-    -- :StateRestore it also re-selects the current file.
+    -- :StateBackRestore it also re-selects the current file. Warm because
+    -- nvim-tree's setup.eager_open prebuilds the explorer during its setup().
     tree.open(current, config.tree_focus)
   end
   vim.api.nvim_exec_autocmds('User', { pattern = 'StateBackRestorePost' })
@@ -247,7 +237,8 @@ function M.setup(opts)
   config = vim.tbl_deep_extend('force', config, opts or {})
   persist.dir = config.dir
 
-  -- Track the last active file buffer.
+  -- Track the last active file buffer (what save() falls back to when the
+  -- final buffer is a tree/terminal window).
   vim.api.nvim_create_autocmd('BufEnter', {
     group = augroup,
     callback = function()
@@ -258,18 +249,7 @@ function M.setup(opts)
     end,
   })
 
-  -- Track cursor position cheaply on every move.
-  vim.api.nvim_create_autocmd('CursorMoved', {
-    group = augroup,
-    callback = function()
-      local buf = vim.api.nvim_get_current_buf()
-      if is_restorable(buf) then
-        record_cursor(vim.api.nvim_buf_get_name(buf))
-      end
-    end,
-  })
-
-  -- Capture the full window view when leaving a buffer.
+  -- Capture the full window view (cursor included) when leaving a buffer.
   vim.api.nvim_create_autocmd('BufLeave', {
     group = augroup,
     callback = function()
@@ -283,10 +263,16 @@ function M.setup(opts)
   -- Save on exit.
   vim.api.nvim_create_autocmd('VimLeavePre', {
     group = augroup,
-    callback = M.save,
+    callback = function()
+      if config.autosave then
+        M.save()
+      end
+    end,
   })
 
-  -- Never auto-restore over piped stdin (e.g. `cat file | nvim -`).
+  -- Never auto-restore over piped stdin (e.g. `cat file | nvim`). Only sees
+  -- the event when setup() runs before stdin is read (eager load); the lazy
+  -- UIEnter load is covered by the modified-buffer check in restore().
   vim.api.nvim_create_autocmd('StdinReadPre', {
     group = augroup,
     callback = function()
@@ -299,17 +285,14 @@ function M.setup(opts)
   vim.api.nvim_create_user_command('StateBackClear', M.clear, { desc = 'state-back: delete saved state for current directory' })
 
   -- Startup path: restore synchronously so the first painted frame already
-  -- contains the saved session. The restore itself is tuned to stay inside
-  -- the <10 ms config() call that lazy attributes to this plugin (cheap
-  -- :badd + noautocmd edit, git status suppressed for the first tree render).
+  -- contains the saved session. The restore itself stays fast: cheap :badd
+  -- batch, :noautocmd edit, git status suppressed for the first tree render.
   if config.autoload then
-    local t0 = vim.loop.hrtime()
+    local t0 = vim.uv.hrtime()
     local restored = M.restore()
     if config.log_stats and restored then
-      local nbufs = #vim.fn.getbufinfo({ buflisted = 1 })
-      local ft = vim.bo[vim.api.nvim_get_current_buf()].filetype
       vim.notify(
-        string.format('state-back: restore %.1f ms (%d buffers, ft=%s)', (vim.loop.hrtime() - t0) / 1e6, nbufs, ft)
+        string.format('state-back: restored %d buffers in %.1f ms', #vim.fn.getbufinfo({ buflisted = 1 }), (vim.uv.hrtime() - t0) / 1e6)
       )
     end
   end
